@@ -97,12 +97,14 @@ export async function handleOfflineRequest(request, bindings) {
     const songId = path.split('/')[3];
     const scoreData = await request.json();
 
-    const scoreKey = `score:${username}:${songId}:${Date.now()}`;
+    const ts = Date.now();
+    const suffix = Math.random().toString(36).slice(2, 8);
+    const scoreKey = `score:${username}:${songId}:${ts}:${suffix}`;
     await PENDING_SCORES.put(scoreKey, JSON.stringify({
       songId,
       username,
       scoreData,
-      timestamp: new Date().toISOString()
+      keyTimestamp: ts
     }));
 
     return new Response(JSON.stringify({ ok: true }), {
@@ -152,14 +154,24 @@ export async function syncToOriginalServer(bindings) {
   const credList = await USER_DATA.list({ prefix: 'cred:' });
   const pendingScoresList = await PENDING_SCORES.list({ prefix: 'score:' });
 
-  // 按用户分组暂存成绩
+  // 按用户分组暂存成绩，保留原始 KV key 用于删除
   const scoresByUser = {};
   for (const key of pendingScoresList.keys) {
     const parts = key.name.split(':');
     const username = parts[1];
     if (!scoresByUser[username]) scoresByUser[username] = [];
     const scoreData = await PENDING_SCORES.get(key.name, 'json');
-    scoresByUser[username].push(scoreData);
+    if (
+      !scoreData ||
+      typeof scoreData !== 'object' ||
+      Array.isArray(scoreData) ||
+      !scoreData.songId ||
+      !scoreData.scoreData
+    ) {
+      console.warn(`跳过无效暂存记录: ${key.name}`);
+      continue;
+    }
+    scoresByUser[username].push({ ...scoreData, _kvKey: key.name });
   }
 
   for (const credKey of credList.keys) {
@@ -182,18 +194,48 @@ export async function syncToOriginalServer(bindings) {
 
     const userScores = scoresByUser[username] || [];
     for (const score of userScores) {
+      if (!score.songId || !score.scoreData) {
+        console.warn(`跳过字段缺失的成绩记录: ${score._kvKey || 'unknown'}`);
+        continue;
+      }
       const scoreUrl = `https://fandorabox.net/api/maichart/${score.songId}/score`;
-      await fetch(scoreUrl, {
-        method: 'POST',
-        headers: {
-          'Cookie': originalCookies,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(score.scoreData)
-      });
 
-      // 清理已同步的数据
-      await PENDING_SCORES.delete(`score:${username}:${score.songId}:${score.timestamp}`);
+      let uploadOk = false;
+      try {
+        const res = await fetch(scoreUrl, {
+          method: 'POST',
+          headers: {
+            'Cookie': originalCookies,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(score.scoreData)
+        });
+        uploadOk = res.ok;
+        if (!uploadOk) {
+          console.warn(`上传成绩失败 (${res.status}): ${score._kvKey || score.songId}`);
+        }
+      } catch (err) {
+        console.error(`上传成绩异常: ${score._kvKey || score.songId}`, err);
+      }
+
+      // 仅在上传成功时清理暂存数据
+      if (uploadOk) {
+        try {
+          if (score._kvKey) {
+            await PENDING_SCORES.delete(score._kvKey);
+          } else {
+            // 兼容旧记录：尝试 keyTimestamp 和 timestamp 两种格式
+            if (score.keyTimestamp) {
+              await PENDING_SCORES.delete(`score:${username}:${score.songId}:${score.keyTimestamp}`);
+            }
+            if (score.timestamp) {
+              await PENDING_SCORES.delete(`score:${username}:${score.songId}:${score.timestamp}`);
+            }
+          }
+        } catch (delErr) {
+          console.error(`删除暂存记录失败: ${score._kvKey || score.songId}`, delErr);
+        }
+      }
     }
   }
 
